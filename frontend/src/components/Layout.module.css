@@ -1,0 +1,22 @@
+.layout {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.main {
+    flex: 1;
+    padding: 40px 0 80px;
+}
+
+.footer {
+    padding: 24px 0;
+    border-top: 1px solid var(--color-border);
+    background: var(--color-bg-secondary);
+}
+
+.footer p {
+    text-align: center;
+    font-size: 0.875rem;
+    color: var(--color-text-muted);
+}
