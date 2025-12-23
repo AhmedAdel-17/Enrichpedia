@@ -1,7 +1,8 @@
-# Planning Agent with Semantic Clustering
+# Planning Agent with Aggressive Multi-Article Clustering
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict, Counter
 import numpy as np
+import logging
 
 from app.agents.base_agent import BaseAgent
 from app.models.schemas import (
@@ -18,21 +19,34 @@ from app.services.embedding_service import EmbeddingService
 class PlanningAgent(BaseAgent):
     """
     Multi-article planning agent that clusters posts semantically using BERT embeddings
-    and generates multiple ArticlePlans for diverse content.
+    and generates MULTIPLE ArticlePlans when content diversity exists.
     
-    CRITICAL: This agent must generate multiple articles when content is diverse.
-    Page/group itself must NEVER be the main article topic.
+    CRITICAL RULES:
+    - Each post is treated as an independent knowledge unit
+    - Multiple articles are REQUIRED when content diversity exists
+    - Single article ONLY allowed if: posts <= 2 OR similarity >= 0.9
+    - NEVER collapse all posts into one article by default
+    - NEVER use page/group name as article topic
     """
     
+    # Clustering parameters - tuned for aggressive multi-article generation
     MIN_POSTS_PER_CLUSTER = 2
-    MAX_ARTICLES = 10
+    MAX_ARTICLES = 15
     MIN_POSTS_FOR_MULTI_ARTICLE = 3
-    SIMILARITY_THRESHOLD = 0.75  # Posts more similar than this go in same cluster
-    MIN_CLUSTER_SEPARATION = 0.5  # Clusters must be at least this different
+    
+    # DBSCAN parameters - LOW eps to create MORE clusters
+    INITIAL_EPS = 0.35  # Start with low threshold for more clusters
+    MIN_EPS = 0.15      # Minimum threshold
+    MAX_EPS = 0.60      # Maximum threshold
+    EPS_STEP = 0.05     # Step for threshold adjustment
+    
+    # Similarity thresholds
+    SINGLE_ARTICLE_SIMILARITY_THRESHOLD = 0.9  # Only allow single article if ALL posts are this similar
     
     def __init__(self):
         super().__init__("PlanningAgent")
         self.embedding_service = EmbeddingService()
+        self.logger = logging.getLogger("planning_agent")
 
     async def execute(
         self,
@@ -42,34 +56,58 @@ class PlanningAgent(BaseAgent):
     ) -> List[ArticlePlan]:
         """
         Main execution: clusters posts semantically and returns MULTIPLE article plans.
-        Uses BERT embeddings for understanding post relationships.
+        Uses DBSCAN clustering with automatic threshold adjustment.
+        
+        GUARANTEES:
+        - Returns multiple ArticlePlans when content diversity exists
+        - Single ArticlePlan only if posts <= 2 or all posts have similarity >= 0.9
         """
-        self.log_info(f"Planning articles from {len(comprehension_results)} posts using semantic clustering")
+        n_posts = len(comprehension_results)
+        self.log_info(f"Planning articles from {n_posts} posts using DBSCAN clustering")
 
-        if len(comprehension_results) < self.MIN_POSTS_FOR_MULTI_ARTICLE:
+        # Edge case: too few posts for multi-article
+        if n_posts < self.MIN_POSTS_FOR_MULTI_ARTICLE:
+            self.log_info(f"Only {n_posts} posts - insufficient for multi-article (threshold: {self.MIN_POSTS_FOR_MULTI_ARTICLE})")
             plan = self._create_single_plan(crawl_result, comprehension_results, tag_results)
-            self.log_info("Created 1 article plan (insufficient posts for clustering)")
             return [plan]
 
-        # Get post texts for embedding
-        post_id_to_idx = {c.post_id: idx for idx, c in enumerate(comprehension_results)}
+        # Generate embeddings for all posts
         post_texts = self._get_post_texts(crawl_result, comprehension_results)
-        
-        # Generate embeddings
         self.log_info("Generating embeddings for semantic clustering")
         embeddings = self.embedding_service.get_embeddings(post_texts)
         
-        # Perform semantic clustering
-        clusters = self._semantic_cluster_posts(
-            embeddings, 
-            comprehension_results, 
-            tag_results
-        )
-        
-        if len(clusters) == 0:
+        if len(embeddings) == 0:
+            self.log_warning("No embeddings generated - falling back to single article")
             plan = self._create_single_plan(crawl_result, comprehension_results, tag_results)
             return [plan]
-
+        
+        # Compute similarity matrix
+        similarity_matrix = self.embedding_service.compute_similarity_matrix(embeddings)
+        
+        # Check if ALL posts are extremely similar (single article condition)
+        avg_similarity = self._compute_average_similarity(similarity_matrix)
+        min_similarity = self._compute_min_similarity(similarity_matrix)
+        
+        self.log_info(f"Similarity stats: avg={avg_similarity:.3f}, min={min_similarity:.3f}")
+        
+        if min_similarity >= self.SINGLE_ARTICLE_SIMILARITY_THRESHOLD:
+            self.log_info(f"All posts have similarity >= {self.SINGLE_ARTICLE_SIMILARITY_THRESHOLD} - single article justified")
+            plan = self._create_single_plan(crawl_result, comprehension_results, tag_results)
+            return [plan]
+        
+        # Run DBSCAN clustering with automatic threshold adjustment
+        clusters = self._run_adaptive_dbscan(embeddings, comprehension_results, tag_results)
+        
+        if len(clusters) == 0:
+            self.log_warning("DBSCAN produced no valid clusters - using topic-based fallback")
+            clusters = self._fallback_topic_clustering(comprehension_results, tag_results)
+        
+        # CRITICAL: If we still have only 1 cluster but similarity is low, FORCE split
+        if len(clusters) <= 1 and min_similarity < self.SINGLE_ARTICLE_SIMILARITY_THRESHOLD:
+            self.log_warning(f"Only {len(clusters)} cluster(s) but min_similarity={min_similarity:.3f} < {self.SINGLE_ARTICLE_SIMILARITY_THRESHOLD}")
+            self.log_info("FORCING split using k-means based approach")
+            clusters = self._force_multiple_clusters(embeddings, comprehension_results, tag_results, n_posts)
+        
         # Create article plans from clusters
         article_plans = []
         for cluster_name, post_ids in clusters.items():
@@ -95,12 +133,260 @@ class PlanningAgent(BaseAgent):
             if len(article_plans) >= self.MAX_ARTICLES:
                 break
 
+        # Safety: if no plans were created, create single plan with explicit logging
         if len(article_plans) == 0:
+            self.log_warning("SAFETY FALLBACK: No article plans created - creating single article")
             plan = self._create_single_plan(crawl_result, comprehension_results, tag_results)
             article_plans = [plan]
-
-        self.log_info(f"Created {len(article_plans)} article plans from semantic clusters")
+        
+        self.log_info(f"RESULT: Created {len(article_plans)} article plans from {n_posts} posts")
+        
+        # === TEMPORARY DEBUG LOGGING (USER REQUESTED) ===
+        self.log_info(f"[PLANNING] Total posts received: {n_posts}")
+        self.log_info(f"[PLANNING] Total clusters formed: {len(article_plans)}")
+        for i, plan in enumerate(article_plans):
+            post_count = sum(len(s.content_sources) for s in plan.sections)
+            self.log_info(f"[PLANNING] ArticlePlan {i}: title='{plan.title}', post_refs={post_count}")
+        # === END TEMPORARY DEBUG LOGGING ===
+        
+        # ASSERTION: Log explicit warning if single article from many posts
+        if len(article_plans) == 1 and n_posts >= self.MIN_POSTS_FOR_MULTI_ARTICLE:
+            self.log_warning(
+                f"ATTENTION: Single article from {n_posts} posts. "
+                f"Similarity: avg={avg_similarity:.3f}, min={min_similarity:.3f}. "
+                f"This should only happen if all posts are nearly identical."
+            )
+        
         return article_plans
+
+
+    def _compute_average_similarity(self, similarity_matrix: np.ndarray) -> float:
+        """Compute average pairwise similarity (excluding diagonal)."""
+        n = len(similarity_matrix)
+        if n <= 1:
+            return 1.0
+        
+        # Get upper triangle without diagonal
+        upper_triangle = np.triu(similarity_matrix, k=1)
+        n_pairs = (n * (n - 1)) // 2
+        return float(np.sum(upper_triangle) / n_pairs) if n_pairs > 0 else 1.0
+
+    def _compute_min_similarity(self, similarity_matrix: np.ndarray) -> float:
+        """Compute minimum pairwise similarity (excluding diagonal)."""
+        n = len(similarity_matrix)
+        if n <= 1:
+            return 1.0
+        
+        # Set diagonal to 1.0 (self-similarity) then find min of off-diagonal
+        sim_copy = similarity_matrix.copy()
+        np.fill_diagonal(sim_copy, 1.0)
+        
+        # Get minimum from upper triangle
+        min_val = 1.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if similarity_matrix[i, j] < min_val:
+                    min_val = similarity_matrix[i, j]
+        
+        return float(min_val)
+
+    def _run_adaptive_dbscan(
+        self,
+        embeddings: np.ndarray,
+        comprehension_results: List[ComprehensionResult],
+        tag_results: List[TagResult],
+    ) -> Dict[str, List[str]]:
+        """
+        Run DBSCAN with adaptive eps parameter to ensure multiple clusters.
+        Starts with low eps and increases if too many noise points.
+        """
+        from sklearn.cluster import DBSCAN
+        from sklearn.metrics.pairwise import cosine_distances
+        
+        # Convert to distance matrix (DBSCAN uses distance, not similarity)
+        distance_matrix = cosine_distances(embeddings)
+        
+        best_clusters = {}
+        best_n_clusters = 0
+        best_eps = self.INITIAL_EPS
+        
+        # Try different eps values to find optimal clustering
+        current_eps = self.INITIAL_EPS
+        
+        while current_eps <= self.MAX_EPS:
+            clustering = DBSCAN(
+                eps=current_eps,
+                min_samples=self.MIN_POSTS_PER_CLUSTER,
+                metric='precomputed'
+            ).fit(distance_matrix)
+            
+            labels = clustering.labels_
+            unique_labels = set(labels)
+            unique_labels.discard(-1)  # Remove noise label
+            n_clusters = len(unique_labels)
+            n_noise = list(labels).count(-1)
+            
+            self.log_info(f"DBSCAN eps={current_eps:.2f}: {n_clusters} clusters, {n_noise} noise points")
+            
+            # Track best result (most clusters with acceptable noise)
+            if n_clusters > best_n_clusters and n_noise < len(embeddings) * 0.5:
+                best_n_clusters = n_clusters
+                best_eps = current_eps
+                best_clusters = self._labels_to_clusters(
+                    labels, 
+                    comprehension_results, 
+                    tag_results
+                )
+            
+            # If we have multiple clusters, we're done
+            if n_clusters >= 2:
+                self.log_info(f"Found {n_clusters} clusters at eps={current_eps:.2f}")
+                return self._labels_to_clusters(labels, comprehension_results, tag_results)
+            
+            # Try lower eps for more clusters
+            current_eps -= self.EPS_STEP
+            if current_eps < self.MIN_EPS:
+                break
+        
+        # If low eps didn't work, try higher eps to reduce noise
+        current_eps = self.INITIAL_EPS + self.EPS_STEP
+        while current_eps <= self.MAX_EPS:
+            clustering = DBSCAN(
+                eps=current_eps,
+                min_samples=self.MIN_POSTS_PER_CLUSTER,
+                metric='precomputed'
+            ).fit(distance_matrix)
+            
+            labels = clustering.labels_
+            unique_labels = set(labels)
+            unique_labels.discard(-1)
+            n_clusters = len(unique_labels)
+            n_noise = list(labels).count(-1)
+            
+            self.log_info(f"DBSCAN eps={current_eps:.2f}: {n_clusters} clusters, {n_noise} noise points")
+            
+            if n_clusters > best_n_clusters:
+                best_n_clusters = n_clusters
+                best_eps = current_eps
+                best_clusters = self._labels_to_clusters(
+                    labels, 
+                    comprehension_results, 
+                    tag_results
+                )
+            
+            if n_clusters >= 2:
+                return self._labels_to_clusters(labels, comprehension_results, tag_results)
+            
+            current_eps += self.EPS_STEP
+        
+        self.log_info(f"Best DBSCAN result: {best_n_clusters} clusters at eps={best_eps:.2f}")
+        return best_clusters
+
+    def _labels_to_clusters(
+        self,
+        labels: np.ndarray,
+        comprehension_results: List[ComprehensionResult],
+        tag_results: List[TagResult],
+    ) -> Dict[str, List[str]]:
+        """Convert DBSCAN labels to named clusters."""
+        tag_map = {tr.post_id: tr for tr in tag_results}
+        clusters: Dict[int, List[int]] = defaultdict(list)
+        noise_posts: List[int] = []
+        
+        for idx, label in enumerate(labels):
+            if label == -1:
+                noise_posts.append(idx)
+            else:
+                clusters[label].append(idx)
+        
+        # Assign noise points to nearest cluster
+        if noise_posts and clusters:
+            # For now, add noise to largest cluster (can be improved)
+            largest_cluster = max(clusters.keys(), key=lambda k: len(clusters[k]))
+            clusters[largest_cluster].extend(noise_posts)
+        elif noise_posts and not clusters:
+            # All points are noise - create one cluster from all
+            clusters[0] = noise_posts
+        
+        # Name clusters based on content
+        named_clusters: Dict[str, List[str]] = {}
+        for cluster_id, post_indices in clusters.items():
+            post_ids = [comprehension_results[i].post_id for i in post_indices]
+            cluster_comps = [comprehension_results[i] for i in post_indices]
+            cluster_tags = [tag_map.get(pid) for pid in post_ids if pid in tag_map]
+            
+            cluster_name = self._generate_cluster_name(cluster_comps, cluster_tags)
+            
+            # Ensure unique names
+            if cluster_name in named_clusters:
+                cluster_name = f"{cluster_name} ({cluster_id + 1})"
+            
+            named_clusters[cluster_name] = post_ids
+        
+        return named_clusters
+
+    def _force_multiple_clusters(
+        self,
+        embeddings: np.ndarray,
+        comprehension_results: List[ComprehensionResult],
+        tag_results: List[TagResult],
+        n_posts: int,
+    ) -> Dict[str, List[str]]:
+        """
+        FORCE creation of multiple clusters when DBSCAN fails but content is diverse.
+        Uses K-means with k = max(2, n_posts // 3).
+        """
+        from sklearn.cluster import KMeans
+        
+        # Determine number of clusters: at least 2, at most n_posts // 2
+        n_clusters = max(2, min(n_posts // 3, 5))
+        
+        self.log_info(f"Forcing {n_clusters} clusters using K-means")
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        
+        return self._labels_to_clusters(labels, comprehension_results, tag_results)
+
+    def _fallback_topic_clustering(
+        self,
+        comprehension_results: List[ComprehensionResult],
+        tag_results: List[TagResult],
+    ) -> Dict[str, List[str]]:
+        """
+        Fallback clustering using topics and entities when embedding clustering fails.
+        MUST produce multiple clusters if content is diverse.
+        """
+        tag_map = {tr.post_id: tr for tr in tag_results}
+        topic_clusters: Dict[str, List[str]] = defaultdict(list)
+        
+        for comp in comprehension_results:
+            post_id = comp.post_id
+            tag_result = tag_map.get(post_id)
+            
+            # Determine primary topic - be more aggressive about splitting
+            primary_topic = self._determine_primary_topic(comp, tag_result)
+            topic_clusters[primary_topic].append(post_id)
+        
+        # DON'T merge aggressively - keep clusters separate
+        final_clusters: Dict[str, List[str]] = {}
+        orphan_posts: List[str] = []
+        
+        for topic, post_ids in topic_clusters.items():
+            if len(post_ids) >= self.MIN_POSTS_PER_CLUSTER:
+                final_clusters[topic] = post_ids
+            else:
+                orphan_posts.extend(post_ids)
+        
+        # Handle orphans: create "Miscellaneous" cluster if enough
+        if len(orphan_posts) >= self.MIN_POSTS_PER_CLUSTER:
+            final_clusters["Miscellaneous Topics"] = orphan_posts
+        elif orphan_posts and final_clusters:
+            # Add to smallest cluster to balance
+            smallest_cluster = min(final_clusters.keys(), key=lambda k: len(final_clusters[k]))
+            final_clusters[smallest_cluster].extend(orphan_posts)
+        
+        return final_clusters
 
     def _get_post_texts(
         self,
@@ -114,104 +400,36 @@ class PlanningAgent(BaseAgent):
         for comp in comprehension_results:
             post = post_map.get(comp.post_id)
             if post:
-                # Combine post content with extracted topics and keywords for richer embedding
+                # Combine content with extracted features for richer embedding
                 text_parts = [post.content[:1500]]
                 text_parts.extend(comp.topics[:5])
                 text_parts.extend(comp.keywords[:10])
+                for entity in comp.entities[:5]:
+                    text_parts.append(entity.text)
                 texts.append(" ".join(text_parts))
             else:
                 texts.append("")
         
         return texts
 
-    def _semantic_cluster_posts(
-        self,
-        embeddings: np.ndarray,
-        comprehension_results: List[ComprehensionResult],
-        tag_results: List[TagResult],
-    ) -> Dict[str, List[str]]:
-        """
-        Cluster posts semantically using embeddings and hierarchical approach.
-        Returns dict mapping cluster name to list of post IDs.
-        """
-        if len(embeddings) == 0:
-            return {}
-        
-        # Compute similarity matrix
-        similarity_matrix = self.embedding_service.compute_similarity_matrix(embeddings)
-        
-        # Use agglomerative clustering approach
-        n_posts = len(comprehension_results)
-        post_ids = [c.post_id for c in comprehension_results]
-        
-        # Initialize: each post in its own cluster
-        cluster_assignments = list(range(n_posts))
-        
-        # Merge similar posts into clusters
-        for i in range(n_posts):
-            for j in range(i + 1, n_posts):
-                if similarity_matrix[i, j] >= self.SIMILARITY_THRESHOLD:
-                    # Merge clusters
-                    old_cluster = cluster_assignments[j]
-                    new_cluster = cluster_assignments[i]
-                    for k in range(n_posts):
-                        if cluster_assignments[k] == old_cluster:
-                            cluster_assignments[k] = new_cluster
-        
-        # Group posts by cluster assignment
-        raw_clusters: Dict[int, List[int]] = defaultdict(list)
-        for idx, cluster_id in enumerate(cluster_assignments):
-            raw_clusters[cluster_id].append(idx)
-        
-        # Filter and name clusters
-        tag_map = {tr.post_id: tr for tr in tag_results}
-        named_clusters: Dict[str, List[str]] = {}
-        
-        for cluster_id, post_indices in raw_clusters.items():
-            if len(post_indices) < self.MIN_POSTS_PER_CLUSTER:
-                continue
-            
-            cluster_post_ids = [post_ids[i] for i in post_indices]
-            cluster_comps = [comprehension_results[i] for i in post_indices]
-            cluster_tags_list = [tag_map.get(pid) for pid in cluster_post_ids if pid in tag_map]
-            
-            # Generate cluster name from content (NOT page name)
-            cluster_name = self._generate_cluster_name(cluster_comps, cluster_tags_list)
-            
-            # Ensure unique cluster names
-            if cluster_name in named_clusters:
-                cluster_name = f"{cluster_name} ({len(named_clusters) + 1})"
-            
-            named_clusters[cluster_name] = cluster_post_ids
-        
-        # If diversity is low (all posts very similar), still try to split by topic
-        if len(named_clusters) <= 1 and n_posts >= 4:
-            named_clusters = self._fallback_topic_clustering(
-                comprehension_results, 
-                tag_results
-            )
-        
-        return named_clusters
-
     def _generate_cluster_name(
         self,
         comprehensions: List[ComprehensionResult],
         tag_results: List[Optional[TagResult]],
     ) -> str:
-        """Generate a meaningful cluster name from post content."""
-        # Collect all important entities
+        """Generate a meaningful cluster name from post content. NEVER use page name."""
+        # Priority 1: Named entities
         entity_counter = Counter()
         for comp in comprehensions:
             for entity in comp.entities:
                 if entity.label in ["PERSON", "ORG", "EVENT", "PRODUCT", "WORK_OF_ART", "GPE"]:
                     entity_counter[entity.text] += 1
         
-        # Use most common entity as cluster name
         if entity_counter:
             most_common = entity_counter.most_common(1)[0][0]
             return most_common
         
-        # Fall back to topics
+        # Priority 2: Topics
         topic_counter = Counter()
         for comp in comprehensions:
             for topic in comp.topics:
@@ -221,7 +439,7 @@ class PlanningAgent(BaseAgent):
             most_common = topic_counter.most_common(1)[0][0]
             return most_common.title()
         
-        # Fall back to categories
+        # Priority 3: Categories
         category_counter = Counter()
         for tag in tag_results:
             if tag:
@@ -232,30 +450,17 @@ class PlanningAgent(BaseAgent):
             most_common = category_counter.most_common(1)[0][0]
             return most_common.title()
         
+        # Priority 4: Keywords
+        keyword_counter = Counter()
+        for comp in comprehensions:
+            for kw in comp.keywords[:5]:
+                keyword_counter[kw] += 1
+        
+        if keyword_counter:
+            most_common = keyword_counter.most_common(1)[0][0]
+            return most_common.title()
+        
         return "General Content"
-
-    def _fallback_topic_clustering(
-        self,
-        comprehension_results: List[ComprehensionResult],
-        tag_results: List[TagResult],
-    ) -> Dict[str, List[str]]:
-        """
-        Fallback clustering using topics and categories when semantic clustering
-        produces too few clusters.
-        """
-        tag_map = {tr.post_id: tr for tr in tag_results}
-        topic_clusters: Dict[str, List[str]] = defaultdict(list)
-        
-        for comp in comprehension_results:
-            post_id = comp.post_id
-            tag_result = tag_map.get(post_id)
-            
-            # Determine primary topic
-            primary_topic = self._determine_primary_topic(comp, tag_result)
-            topic_clusters[primary_topic].append(post_id)
-        
-        # Merge small clusters
-        return self._merge_small_clusters(topic_clusters)
 
     def _determine_primary_topic(
         self,
@@ -263,7 +468,7 @@ class PlanningAgent(BaseAgent):
         tag_result: Optional[TagResult],
     ) -> str:
         """Determine the primary topic for a single post."""
-        # Priority: Named entities > Topics > Categories
+        # Priority: Named entities > Topics > Categories > Keywords
         important_entities = [
             e.text for e in comp.entities 
             if e.label in ["PERSON", "ORG", "EVENT", "PRODUCT", "WORK_OF_ART"]
@@ -276,30 +481,11 @@ class PlanningAgent(BaseAgent):
 
         if tag_result and tag_result.categories:
             return tag_result.categories[0]
+        
+        if comp.keywords:
+            return comp.keywords[0]
 
         return "general"
-
-    def _merge_small_clusters(
-        self,
-        clusters: Dict[str, List[str]],
-    ) -> Dict[str, List[str]]:
-        """Merge clusters with too few posts."""
-        merged: Dict[str, List[str]] = {}
-        small_cluster_posts: List[str] = []
-        
-        for topic, post_ids in clusters.items():
-            if len(post_ids) < self.MIN_POSTS_PER_CLUSTER:
-                small_cluster_posts.extend(post_ids)
-            else:
-                merged[topic] = post_ids.copy()
-
-        if small_cluster_posts and len(small_cluster_posts) >= self.MIN_POSTS_PER_CLUSTER:
-            merged["Miscellaneous"] = small_cluster_posts
-        elif small_cluster_posts and merged:
-            largest_cluster = max(merged.keys(), key=lambda k: len(merged[k]))
-            merged[largest_cluster].extend(small_cluster_posts)
-
-        return merged
 
     def _create_cluster_plan(
         self,
@@ -345,7 +531,9 @@ class PlanningAgent(BaseAgent):
         comprehension_results: List[ComprehensionResult],
         tag_results: List[TagResult],
     ) -> ArticlePlan:
-        """Fallback: create a single plan when clustering is not possible."""
+        """Create a single plan. ONLY used when legitimately justified."""
+        self.log_info("Creating single article plan (justified by low post count or high similarity)")
+        
         dominant_language = self._determine_dominant_language(comprehension_results)
         dominant_dialect = self._determine_dominant_dialect(comprehension_results)
 
@@ -369,8 +557,8 @@ class PlanningAgent(BaseAgent):
         language: str,
     ) -> str:
         """Generate a title based on the cluster topic."""
-        if cluster_name and cluster_name.lower() not in ["general", "miscellaneous", "general content"]:
-            return cluster_name.title()
+        if cluster_name and cluster_name.lower() not in ["general", "miscellaneous", "general content", "miscellaneous topics"]:
+            return cluster_name.title() if cluster_name.isascii() else cluster_name
 
         all_entities = []
         for comp in comprehension_results:
@@ -450,7 +638,7 @@ class PlanningAgent(BaseAgent):
         if top_keywords:
             return f"Content covering: {', '.join(top_keywords)}"
         
-        if cluster_name and cluster_name.lower() not in ["general", "miscellaneous"]:
+        if cluster_name and cluster_name.lower() not in ["general", "miscellaneous", "general content"]:
             return f"Information about {cluster_name}"
         
         return f"Article compiled from {len(comprehension_results)} sources"

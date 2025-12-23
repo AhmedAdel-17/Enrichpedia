@@ -45,6 +45,8 @@ class ApifyService:
         actor_input = {
             "startUrls": [{"url": page_url}],
             "maxPosts": max_posts,
+            "resultsLimit": max_posts,  # Explicitly set results limit
+            "view": "latest",           # Force latest posts
             "maxPostComments": 10,
             "maxReviewComments": 0,
             "scrapeAbout": True,
@@ -62,6 +64,7 @@ class ApifyService:
         actor_input = {
             "startUrls": [{"url": group_url}],
             "maxPosts": max_posts,
+            "resultsLimit": max_posts,
             "maxComments": 10,
         }
         
