@@ -141,14 +141,6 @@ class PlanningAgent(BaseAgent):
         
         self.log_info(f"RESULT: Created {len(article_plans)} article plans from {n_posts} posts")
         
-        # === TEMPORARY DEBUG LOGGING (USER REQUESTED) ===
-        self.log_info(f"[PLANNING] Total posts received: {n_posts}")
-        self.log_info(f"[PLANNING] Total clusters formed: {len(article_plans)}")
-        for i, plan in enumerate(article_plans):
-            post_count = sum(len(s.content_sources) for s in plan.sections)
-            self.log_info(f"[PLANNING] ArticlePlan {i}: title='{plan.title}', post_refs={post_count}")
-        # === END TEMPORARY DEBUG LOGGING ===
-        
         # ASSERTION: Log explicit warning if single article from many posts
         if len(article_plans) == 1 and n_posts >= self.MIN_POSTS_FOR_MULTI_ARTICLE:
             self.log_warning(
